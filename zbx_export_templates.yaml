@@ -1,0 +1,312 @@
+zabbix_export:
+  version: "7.4"
+  template_groups:
+    - uuid: c2c162144c2d4c5491c8801193af4945
+      name: Templates/Cloud
+  templates:
+    - uuid: 2a18325c56d7452f9b183b34ab7ccc71
+      template: "Azure Elastic Pools by HTTP"
+      name: "Azure Elastic Pools by HTTP"
+      description: |
+        This template is designed to monitor Microsoft App Services by HTTP.
+        It works without any external scripts and uses the script item.
+
+        Setup:
+          1. Create an Azure service principal via the Azure command-line interface (Azure CLI) for your subscription.
+            `az ad sp create-for-rbac --name zabbix --role reader --scope /subscriptions/<subscription_id>`
+            See https://docs.microsoft.com/en-us/cli/azure/create-an-azure-service-principal-azure-cli for more details.
+          2. Link the template to a host.
+          3. Configure the macros: {$AZURE.APP.ID}, {$AZURE.PASSWORD}, {$AZURE.TENANT.ID}, {$AZURE.SUBSCRIPTION.ID}, and {$AZURE.RESOURCE.ID}.
+
+        This template has been created by Karanpreet Singh(karanpreetsingh1990@gmail.com) based on the out of the box Azure templates.
+      groups:
+        - name: Templates/Cloud
+      items:
+        - uuid: 69f1420f638f4372b8805e1d4cd8c61c
+          name: "Get errors"
+          type: DEPENDENT
+          key: azure.elastic.pool.data.errors
+          value_type: TEXT
+          description: "A list of errors from API requests."
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.errors
+            - type: DISCARD_UNCHANGED_HEARTBEAT
+              parameters:
+                - 1h
+          master_item:
+            key: azure.elastic.pools.data.get
+          tags:
+            - tag: component
+              value: raw
+          triggers:
+            - uuid: a43152bd3a904df79335613fc923cc23
+              expression: "length(last(/Azure Elastic Pools by HTTP/azure.elastic.pool.data.errors))>0"
+              name: "Elastic Pool data collection errors"
+              opdata: "API Errors"
+              priority: AVERAGE
+              description: "Elastic Pool"
+              tags:
+                - tag: scope
+                  value: availability
+        - uuid: 59c4c94167f84ed69fa41d09ce17e391
+          name: "Resource state"
+          type: DEPENDENT
+          key: azure.elastic.pool.state
+          value_type: CHAR
+          description: "The current resource state of the Elastic pool"
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.properties.state
+          master_item:
+            key: azure.elastic.pools.data.get
+          tags:
+            - tag: component
+              value: health
+          triggers:
+            - uuid: 39fd311e967148788448a16e528d58c5
+              expression: 'count(/Azure Elastic Pools by HTTP/azure.elastic.pool.state,#7,"ne","Ready")=7'
+              recovery_mode: RECOVERY_EXPRESSION
+              recovery_expression: 'count(/Azure Elastic Pools by HTTP/azure.elastic.pool.state,#3,"eq","Ready")=3'
+              name: "Elastic Pool {$AZURE.RESOURCE.NAME} is not in Ready state"
+              opdata: Availability
+              priority: HIGH
+              description: "Elastic Pool"
+              manual_close: "YES"
+        - uuid: 1ecfaf90c02b4f2983cd3b13927cf82e
+          name: "Data space used percent"
+          type: DEPENDENT
+          key: azure.elastic.pool.storage_percent
+          value_type: FLOAT
+          units: "%"
+          description: "Data space used percent. Not applicable to hyperscale"
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.metrics.storage_percent.average
+              error_handler: DISCARD_VALUE
+          master_item:
+            key: azure.elastic.pools.data.get
+          tags:
+            - tag: component
+              value: storage
+          triggers:
+            - uuid: 04040c71ea1b48cf94632b4643e0f480
+              expression: "last(/Azure Elastic Pools by HTTP/azure.elastic.pool.storage_percent)>={$AZURE.EP.STORAGE.PUSED.CRIT}"
+              name: "High Storage Utilization for Elastic Pool {$AZURE.RESOURCE.NAME}"
+              opdata: "Storage Utilization"
+              priority: HIGH
+              description: "Elastic Pool"
+              manual_close: "YES"
+        - uuid: dce9094b1c3243baab0892e5d25a38e6
+          name: "Get data"
+          type: SCRIPT
+          key: azure.elastic.pools.data.get
+          delay: 2m
+          history: "0"
+          value_type: TEXT
+          params: |
+            var AzureElasticPool = {
+              params: {},
+              token: null,
+
+              setParams: function(params) {
+                ['app_id', 'password', 'tenant_id', 'subscription_id', 'resource_id'].forEach(function(field) {
+                  if (typeof params !== 'object' || typeof params[field] === 'undefined' || params[field] === '') {
+                    throw 'Required param is not set: ' + field + '.';
+                  }
+                });
+
+                AzureElasticPool.params = params;
+              },
+
+
+              request: function(url, data) {
+                if (typeof data === 'undefined' || data === null) {
+                  data = '';
+                }
+
+                var response, request = new HttpRequest();
+                if (typeof AzureElasticPool.params.proxy !== 'undefined' && AzureElasticPool.params.proxy !== '') {
+                  request.setProxy(AzureElasticPool.params.proxy);
+                }
+                if (AzureElasticPool.token) {
+                  request.addHeader('Accept: application/json');
+                  request.addHeader('Authorization: Bearer ' + AzureElasticPool.token);
+                }
+
+                Zabbix.log(4, '[ Azure ] Sending request: ' + url);
+
+                if (data !== '') {
+                  request.addHeader('Content-Type: application/x-www-form-urlencoded');
+                  response = request.post(url, data);
+                }
+                else {
+                  response = request.get(url);
+                }
+
+                Zabbix.log(4, '[ Azure ] Received response with status code ' + request.getStatus() + ': ' + response);
+
+                if (request.getStatus() !== 200 || response === null) {
+                  throw 'Request failed with status code ' + request.getStatus() + ': ' + response;
+                }
+
+                try {
+                  return JSON.parse(response);
+                }
+                catch (error) {
+                  throw 'Failed to parse response received from API.';
+                }
+              }
+
+            };
+
+            var metrics = [
+              'storage_percent',
+              'allocated_data_storage_percent'
+            ],
+              prepared_metrics = [],
+              data = {};
+            data['errors'] = {};
+            data['metrics'] = {};
+            data['properties'] = {};
+
+            try {
+              AzureElasticPool.setParams(JSON.parse(value));
+
+              try {
+                result = AzureElasticPool.request(
+                  'https://login.microsoftonline.com/' + encodeURIComponent(AzureElasticPool.params.tenant_id) + '/oauth2/token',
+                  'grant_type=client_credentials&resource=' + encodeURIComponent('https://management.azure.com/') + '&client_id=' + encodeURIComponent(AzureElasticPool.params.app_id) + '&client_secret=' + encodeURIComponent(AzureElasticPool.params.password)
+                );
+
+                if ('access_token' in result) {
+                  AzureElasticPool.token = result['access_token'];
+                } else {
+                  throw 'Auth response does not contain access token.';
+                }
+              }
+              catch (error) {
+                data.errors.auth = error.toString();
+              }
+
+              if (!('auth' in data.errors)) {
+                for (var i = 0; i < metrics.length; i += 20) {
+                  var chunk = metrics.slice(i, i + 20);
+
+                  prepared_metrics.push(
+                    chunk.map(function(element) {
+                      return encodeURIComponent(element);
+                    }).join(',')
+                  );
+                }
+
+                start_date = new Date((new Date().getTime()) - 300000).toISOString().replace(/\.\d+/, '');
+                end_date = new Date().toISOString().replace(/\.\d+/, '');
+
+                for (var j in prepared_metrics) {
+                  try {
+                    metrics_data = AzureElasticPool.request('https://management.azure.com' + AzureElasticPool.params.resource_id + '/providers/Microsoft.Insights/metrics?metricnames=' + prepared_metrics[j] + '&timespan=' + encodeURIComponent(start_date) + '/' + encodeURIComponent(end_date) + '&api-version=2024-02-01');
+                    if ('value' in metrics_data && Array.isArray(metrics_data.value) && metrics_data.value.length > 0) {
+                      for (k in metrics_data.value) {
+                        if ('name' in metrics_data.value[k] && typeof metrics_data.value[k].name === 'object' && 'value' in metrics_data.value[k].name && typeof metrics_data.value[k].name.value === 'string' && 'timeseries' in metrics_data.value[k] && Array.isArray(metrics_data.value[k].timeseries) && metrics_data.value[k].timeseries.length > 0 && 'data' in metrics_data.value[k].timeseries[0] && Array.isArray(metrics_data.value[k].timeseries[0].data) && metrics_data.value[k].timeseries[0].data.length > 0) {
+                          data.metrics[metrics_data.value[k].name.value.replace(/(\s|\/)+/g, '')] = metrics_data.value[k].timeseries[0].data[metrics_data.value[k].timeseries[0].data.length - 1];
+                        }
+                      }
+                    }
+                  }
+                  catch (error) {
+                    data.errors[prepared_metrics[j]] = error.toString();
+                  }
+                }
+
+                try {
+                  resource_data = AzureElasticPool.request('https://management.azure.com' + AzureElasticPool.params.resource_id + '?api-version=2024-08-01-preview');
+                  if ('properties' in resource_data && typeof resource_data.properties === 'object') {
+                    data.properties.state = resource_data.properties.state;
+                  }
+
+                }
+                catch (error) {
+                  data.errors.resource_data = error.toString();
+                }
+
+
+              }
+            }
+            catch (error) {
+              data.errors.params = error.toString();
+            }
+
+            if (Object.keys(data.errors).length !== 0) {
+              errors = 'Failed to receive data:';
+              for (var error in data.errors) {
+                errors += '\n' + error + ' : ' + data.errors[error];
+              }
+              data.errors = errors;
+            }
+            else {
+              data.errors = '';
+            }
+
+            return JSON.stringify(data);
+          description: "The result of API requests is expressed in the JSON."
+          timeout: "{$AZURE.DATA.TIMEOUT}"
+          parameters:
+            - name: app_id
+              value: "{$AZURE.APP.ID}"
+            - name: password
+              value: "{$AZURE.PASSWORD}"
+            - name: proxy
+              value: "{$AZURE.PROXY}"
+            - name: resource_id
+              value: "{$AZURE.RESOURCE.ID}"
+            - name: subscription_id
+              value: "{$AZURE.SUBSCRIPTION.ID}"
+            - name: tenant_id
+              value: "{$AZURE.TENANT.ID}"
+          tags:
+            - tag: component
+              value: raw
+      tags:
+        - tag: class
+          value: software
+        - tag: source
+          value: azure
+        - tag: target
+          value: elastic_pools
+      macros:
+        - macro: "{$AZURE.APP.ID}"
+          description: "The App ID of Microsoft Azure."
+        - macro: "{$AZURE.DATA.TIMEOUT}"
+          value: 30s
+          description: "API response timeout."
+        - macro: "{$AZURE.EP.STORAGE.PUSED.CRIT}"
+          value: "85"
+          description: "Storage Threshold for elastic pools"
+        - macro: "{$AZURE.PASSWORD}"
+          description: "Microsoft Azure password."
+        - macro: "{$AZURE.PROXY}"
+          description: "Sets the HTTP proxy value. If this macro is empty, then no proxy is used."
+        - macro: "{$AZURE.RESOURCE.ID}"
+          description: "Microsoft Azure Microsoft App Service ID."
+        - macro: "{$AZURE.RESOURCE.NAME}"
+          description: "Microsoft Azure Microsoft App Service Name."
+        - macro: "{$AZURE.SUBSCRIPTION.ID}"
+          description: "Microsoft Azure subscription ID."
+        - macro: "{$AZURE.TENANT.ID}"
+          description: "Microsoft Azure tenant ID."
+      valuemaps:
+        - uuid: d99f3589a5d54df1a5fb54b94aa44aaa
+          name: "Azure resource health state"
+          mappings:
+            - value: "0"
+              newvalue: Available
+            - value: "1"
+              newvalue: Degraded
+            - value: "2"
+              newvalue: Unavailable
+            - value: "3"
+              newvalue: Unknown
